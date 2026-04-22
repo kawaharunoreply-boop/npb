@@ -1,5 +1,6 @@
 import discord
 from discord.ext import tasks
+from discord import app_commands # 追加
 import requests
 from bs4 import BeautifulSoup
 from flask import Flask
@@ -10,21 +11,23 @@ import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime
 
-# --- Flask設定 (Renderのスリープ防止) ---
+# --- Flask設定 ---
 app = Flask('')
 @app.route('/')
 def home(): return "Bot is running!"
-def run_flask(): app.run(host='0.0.0.0', port=8080)
+def run_flask(): 
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
 
 # --- Google Sheets API設定 ---
-def get_sheet():
+def get_gs_client():
     scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-    # Renderの環境変数からJSONを読み込む
     env_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if not env_json:
+        print("Error: GOOGLE_SERVICE_ACCOUNT_JSON not found.")
+        return None
     creds = Credentials.from_service_account_info(json.loads(env_json), scopes=scopes)
-    gc = gspread.authorize(creds)
-    # スプレッドシートIDまたはURLで開く
-    return gc.open_by_url(os.environ.get("SHEET_URL")).sheet1
+    return gspread.authorize(creds)
 
 # --- カラー設定 ---
 COLOR_MAP = {
@@ -34,27 +37,41 @@ COLOR_MAP = {
 
 # --- Discord Bot設定 ---
 TOKEN = os.environ.get("DISCORD_TOKEN")
-CHANNEL_ID = int(os.environ.get("CHANNEL_ID"))
-client = discord.Client(intents=discord.Intents.default())
 
-# 重複処理防止用キャッシュ (打席IDや結果を保持)
+# ★修正：CHANNEL_IDを最初はNoneにして、エラー落ちを防ぐ
+CHANNEL_ID = None
+
+# ★Clientのクラスを少し拡張してコマンドツリーを使えるようにする
+class MyClient(discord.Client):
+    def __init__(self):
+        super().__init__(intents=discord.Intents.default())
+        self.tree = app_commands.CommandTree(self)
+
+    async def setup_hook(self):
+        # 起動時にスラッシュコマンドを同期
+        await self.tree.sync()
+
+client = MyClient()
+
+# 重複処理防止用キャッシュ
 last_at_bat_key = ""
 
-@tasks.loop(minutes=2) # 打席ごとなので2分間隔で十分
+@tasks.loop(minutes=2)
 async def fetch_npb_data():
-    global last_at_bat_key
+    global last_at_bat_key, CHANNEL_ID
     
+    # チャンネルIDが設定されていない場合は何もしない
+    if CHANNEL_ID is None:
+        return
+
     # 試合時間外（深夜〜午前）はリクエストしない
     if not (13 <= datetime.now().hour <= 23): return
 
     try:
-        # Yahoo!一打席速報のURL (例: 巨vs神)
-        # ※実際にはその日の試合URLを動的に取得するロジックが必要
         url = "https://baseball.yahoo.co.jp/npb/game/2021006501/text" 
         res = requests.get(url, timeout=10)
         soup = BeautifulSoup(res.text, 'html.parser')
 
-        # 最新の打席ブロックを取得 (クラス名はYahooの仕様変更に合わせて要調整)
         latest_card = soup.select_one('.live-text-item')
         if not latest_card: return
 
@@ -62,68 +79,67 @@ async def fetch_npb_data():
         pitcher = latest_card.select_one('.pitcher').text.strip()
         result = latest_card.select_one('.result').text.strip()
         
-        # カウント・塁状況などの取得（一打席速報の構造から抽出）
-        # ※ここでは簡易的に「打者_結果」をキーにして重複判定
         current_key = f"{batter}_{result}"
         if current_key == last_at_bat_key: return
 
         # --- スプレッドシートへ記録 ---
-        sheet = get_sheet()
+        gc = get_gs_client()
+        sheet = gc.open_by_url(os.environ.get("SHEET_URL")).sheet1
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M')
         sheet.append_row([timestamp, batter, pitcher, result])
 
         # --- Discord通知 (Embed) ---
         channel = client.get_channel(CHANNEL_ID)
-        color = next((v for k, v in COLOR_MAP.items() if k in result), 0x808080)
-
-        embed = discord.Embed(title=f"** 打者 ({batter}) **", color=color)
-        embed.add_field(name="【選手】", value=f"・打者：{batter}\n・投手：{pitcher}", inline=False)
-        embed.add_field(name="【結果】", value=f"**{result}**", inline=False)
-        # ※カウントやスコアもsoupから抽出してadd_field可能
-        embed.set_footer(text=f"{timestamp} @Yahoo実況データ引用")
-
-        await channel.send(embed=embed)
-        last_at_bat_key = current_key
+        if channel:
+            color = next((v for k, v in COLOR_MAP.items() if k in result), 0x808080)
+            embed = discord.Embed(title=f"** 打者 ({batter}) **", color=color)
+            embed.add_field(name="【選手】", value=f"・打者：{batter}\n・投手：{pitcher}", inline=False)
+            embed.add_field(name="【結果】", value=f"**{result}**", inline=False)
+            embed.set_footer(text=f"{timestamp} @Yahoo実況データ引用")
+            await channel.send(embed=embed)
+            last_at_bat_key = current_key
 
     except Exception as e:
         print(f"Error during fetch: {e}")
 
-@client.event
-async def on_ready():
-    print(f'Logged in as {client.user}')
-    fetch_npb_data.start()
-
-# コマンドツリーの準備
-tree = app_commands.CommandTree(client)
-
 # /set_channel コマンド
-@tree.command(name="set_channel", description="NPB速報を流すチャンネルを指定します")
+@client.tree.command(name="set_channel", description="NPB速報を流すチャンネルを指定します")
 @app_commands.describe(target_channel="速報を流したいチャンネルを選択してください")
-@app_commands.checks.has_permissions(manage_channels=True) # チャンネル管理権限が必要
+@app_commands.checks.has_permissions(manage_channels=True)
 async def set_channel(interaction: discord.Interaction, target_channel: discord.TextChannel):
     global CHANNEL_ID
-    
-    # 1. メモリ上のIDを更新
     CHANNEL_ID = target_channel.id
     
-    # 2. スプレッドシートの「設定」シート等に保存（天才的DB活用！）
-    # ここでスプレッドシートの特定のセル（例: B1）にIDを書き込む処理を入れる
     try:
+        gc = get_gs_client()
+        # "config" という名前のシートが既にある前提
         config_sheet = gc.open_by_url(os.environ.get("SHEET_URL")).worksheet("config")
         config_sheet.update_acell('B1', str(target_channel.id))
-        
         await interaction.response.send_message(f"✅ 速報チャンネルを {target_channel.mention} に設定しました！", ephemeral=True)
     except Exception as e:
-        await interaction.response.send_message(f"❌ 設定の保存に失敗しました: {e}", ephemeral=True)
+        # シートがない場合は、単にメモリ上だけで更新
+        await interaction.response.send_message(f"⚠️ メモリ上のみ更新しました（シート'config'が見つかりません）: {e}", ephemeral=True)
 
-# Bot起動時にコマンドを同期
 @client.event
 async def on_ready():
-    await tree.sync() # スラッシュコマンドをDiscordに登録
+    global CHANNEL_ID
     print(f'Logged in as {client.user}')
-    fetch_npb_data.start()
+    
+    # 起動時にスプレッドシートから前回のチャンネルIDを読み込む
+    try:
+        gc = get_gs_client()
+        config_sheet = gc.open_by_url(os.environ.get("SHEET_URL")).worksheet("config")
+        saved_id = config_sheet.acell('B1').value
+        if saved_id:
+            CHANNEL_ID = int(saved_id)
+            print(f"Loaded Channel ID from Sheets: {CHANNEL_ID}")
+    except:
+        print("No saved channel ID found. Please use /set_channel")
 
-# Flaskスレッド開始
-threading.Thread(target=run_flask).start()
+    if not fetch_npb_data.is_running():
+        fetch_npb_data.start()
+
+# Flask開始
+threading.Thread(target=run_flask, daemon=True).start()
 # Bot開始
 client.run(TOKEN)
