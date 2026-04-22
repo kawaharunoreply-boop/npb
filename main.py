@@ -93,6 +93,36 @@ async def on_ready():
     print(f'Logged in as {client.user}')
     fetch_npb_data.start()
 
+# コマンドツリーの準備
+tree = app_commands.CommandTree(client)
+
+# /set_channel コマンド
+@tree.command(name="set_channel", description="NPB速報を流すチャンネルを指定します")
+@app_commands.describe(target_channel="速報を流したいチャンネルを選択してください")
+@app_commands.checks.has_permissions(manage_channels=True) # チャンネル管理権限が必要
+async def set_channel(interaction: discord.Interaction, target_channel: discord.TextChannel):
+    global CHANNEL_ID
+    
+    # 1. メモリ上のIDを更新
+    CHANNEL_ID = target_channel.id
+    
+    # 2. スプレッドシートの「設定」シート等に保存（天才的DB活用！）
+    # ここでスプレッドシートの特定のセル（例: B1）にIDを書き込む処理を入れる
+    try:
+        config_sheet = gc.open_by_url(os.environ.get("SHEET_URL")).worksheet("config")
+        config_sheet.update_acell('B1', str(target_channel.id))
+        
+        await interaction.response.send_message(f"✅ 速報チャンネルを {target_channel.mention} に設定しました！", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ 設定の保存に失敗しました: {e}", ephemeral=True)
+
+# Bot起動時にコマンドを同期
+@client.event
+async def on_ready():
+    await tree.sync() # スラッシュコマンドをDiscordに登録
+    print(f'Logged in as {client.user}')
+    fetch_npb_data.start()
+
 # Flaskスレッド開始
 threading.Thread(target=run_flask).start()
 # Bot開始
